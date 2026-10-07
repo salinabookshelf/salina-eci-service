@@ -1,0 +1,76 @@
+name: Deploy
+
+on:
+  push:
+    branches: ["main"]
+
+# OIDC: the job requests a short-lived token and exchanges it for the deploy role.
+# No AWS keys are stored in this repository.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ECS_SERVICE_NAME: service-prod
+  REPOSITORY_NAME: salina-eci-service
+  IMAGE_TAG: prod
+
+jobs:
+  build-push-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          aws ecr put-image-tag-mutability --repository-name "$REPOSITORY_NAME" --image-tag-mutability MUTABLE
+          docker build -t "$REGISTRY/$REPOSITORY_NAME:$IMAGE_TAG" .
+          docker push "$REGISTRY/$REPOSITORY_NAME:$IMAGE_TAG"
+
+  update-ssm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Update SSM parameters from config file
+        run: |
+          BRANCH_NAME=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            key=${line%%=*}
+            value=${line#*=}
+            echo "Updating /${ECS_SERVICE_NAME}/${key}"
+            aws ssm put-parameter --name "/${ECS_SERVICE_NAME}/${key}" --value "$value" --overwrite --type String
+          done < "configs/${BRANCH_NAME}.conf"
+
+  restart:
+    needs: [build-push-docker, update-ssm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Redeploy ECS service
+        env:
+          ECS_CLUSTER_NAME: ${{ vars.ECS_CLUSTER_NAME }}
+        run: |
+          aws ecs describe-task-definition --task-definition "$ECS_SERVICE_NAME" --query taskDefinition.taskDefinitionArn --output text
+          aws ecs update-service --service "$ECS_SERVICE_NAME" --cluster "$ECS_CLUSTER_NAME" --force-new-deployment
+          aws ecs wait services-stable --services "$ECS_SERVICE_NAME" --cluster "$ECS_CLUSTER_NAME"
